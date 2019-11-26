@@ -22,11 +22,12 @@ require_relative 'kubernetes_metadata_common'
 require_relative 'kubernetes_metadata_stats'
 require_relative 'kubernetes_metadata_watch_namespaces'
 require_relative 'kubernetes_metadata_watch_pods'
+
 require 'fluent/plugin/filter'
-require 'resolv'
 
 module Fluent::Plugin
   class KubernetesMetadataFilter < Fluent::Plugin::Filter
+    @pod_mapping
     K8_POD_CA_CERT = 'ca.crt'
     K8_POD_TOKEN = 'token'
 
@@ -136,7 +137,7 @@ module Fluent::Plugin
             metadata = parse_namespace_metadata(metadata)
             @stats.bump(:namespace_cache_api_updates)
             log.trace("parsed metadata for #{namespace_name}: #{metadata}") if log.trace?
-            @namespace_cache[metadata['namespace_id']] = metadata
+             @namespace_cache[metadata['namespace_id']] = metadata
             return metadata
           rescue Exception => e
             log.debug(e)
@@ -164,6 +165,7 @@ module Fluent::Plugin
       end
 
       require 'kubeclient'
+      require 'active_support/core_ext/object/blank'
       require 'lru_redux'
       @stats = KubernetesMetadata::Stats.new
 
@@ -186,6 +188,10 @@ module Fluent::Plugin
       @namespace_cache = LruRedux::TTL::ThreadSafeCache.new(@cache_size, @cache_ttl)
 
       @tag_to_kubernetes_name_regexp_compiled = Regexp.compile(@tag_to_kubernetes_name_regexp)
+      @tag_to_customlog_kubernetes_name_regexp_compiled = Regexp.compile('^tail\.(?<tag_prefix>[^\.]+)\.var\.lib\.origin\.openshift\.local\.volumes\.pods\.(?<pod_uuid>[-a-z0-9]+)\.volumes\.kubernetes.io~empty-dir\.(?<volume_name>[^\.]+)\.(?<file_name>.*)\.log$')
+      @customlog_string_to_kubernetes_compiled = Regexp.compile('^(?<namespace>[^[:space:]]+)[[:space:]]+(?<pod_name>[^[:space:]]+)[[:space:]]+(?<container_name>[^[:space:]]+)[[:space:]]+(?<docker_id>[^[:space:]]+)$')
+      @pod_log_filename_to_uuid_regexp_compiled = Regexp.compile('^\/var\/log\/pods\/(?<pod_uuid>[-a-z0-9]*)\/.*\/.*\.log$')
+      @container_filename_to_uuid_regexp_compiled = Regexp.compile('^\/var\/log\/containers\/(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container_name>.+)-(?<docker_id>[a-z0-9]{64})\.log$')
       @container_name_to_kubernetes_regexp_compiled = Regexp.compile(@container_name_to_kubernetes_regexp)
 
       # Use Kubernetes default service account if we're in a pod.
@@ -195,10 +201,6 @@ module Fluent::Plugin
         env_host = ENV['KUBERNETES_SERVICE_HOST']
         env_port = ENV['KUBERNETES_SERVICE_PORT']
         if env_host.present? && env_port.present?
-          if env_host =~ Resolv::IPv6::Regex
-            # Brackets are needed around IPv6 addresses
-            env_host = "[#{env_host}]"
-          end
           @kubernetes_url = "https://#{env_host}:#{env_port}/api"
           log.debug "Kubernetes URL is now '#{@kubernetes_url}'"
         end
@@ -284,6 +286,7 @@ module Fluent::Plugin
         end
       end
 
+      @pod_mapping = self.generate_map()
     end
 
     def get_metadata_for_record(namespace_name, pod_name, container_name, container_id, create_time, batch_miss_cache)
@@ -329,6 +332,9 @@ module Fluent::Plugin
       tag_match_data = tag.match(@tag_to_kubernetes_name_regexp_compiled) unless @use_journal
       tag_metadata = nil
       batch_miss_cache = {}
+      unless tag_match_data
+        customlog_vol, customlog_file, tag_match_data = filter_customlog(tag)
+      end
       es.each do |time, record|
         if tag_match_data && tag_metadata.nil?
           tag_metadata = get_metadata_for_record(tag_match_data['namespace'], tag_match_data['pod_name'], tag_match_data['container_name'],
@@ -351,11 +357,61 @@ module Fluent::Plugin
             metadata = k_metadata
         end
 
+        record['customlog_vol'] = customlog_vol if defined?(customlog_vol)
+        record['customlog_file'] = customlog_file if defined?(customlog_file)
         record = record.merge(metadata) if metadata
         new_es.add(time, record)
       end
       dump_stats
       new_es
+    end
+
+    def filter_customlog(tag)
+      tag_match_data = {}
+      customlog_match = tag.match(@tag_to_customlog_kubernetes_name_regexp_compiled)
+      if customlog_match
+        pod_uuid    = customlog_match["pod_uuid"]
+        file_name   = customlog_match["file_name"]
+        volume_name = customlog_match["volume_name"]
+
+        unless @pod_mapping[pod_uuid]
+          @pod_mapping = self.generate_map()
+          log.info "Info: #{pod_uuid} not found, regenerating map"
+        end
+
+        if @pod_mapping[pod_uuid]
+          string = @pod_mapping[pod_uuid][:namespace] + " " + @pod_mapping[pod_uuid][:pod_name] + " customlog " + @pod_mapping[pod_uuid][:docker_id]
+          tag_match_data = string.match(@customlog_string_to_kubernetes_compiled)
+        else
+          log.error "Error: #{pod_uuid} not found"
+        end
+      end
+      return volume_name, file_name, tag_match_data
+    end
+
+    def generate_map()
+      pod_mapping = {}
+      files       = Dir["/var/log/containers/*.log"]
+
+      files.each do |item|
+        match = item.match(@container_filename_to_uuid_regexp_compiled)
+        if match
+          pod_name  = match["pod_name"]
+          namespace = match["namespace"]
+          container_name = match["container_name"]
+          docker_id = match["docker_id"]
+
+          link_target = File.readlink(item)
+          pods_match = link_target.match(@pod_log_filename_to_uuid_regexp_compiled)
+          if pods_match
+            pod_uuid = pods_match["pod_uuid"]
+          end
+
+          log.info "Mapping uuid #{pod_uuid} to #{namespace}/#{pod_name}"
+          pod_mapping[pod_uuid] = { namespace: namespace, pod_name: pod_name, container_name: container_name, docker_id: docker_id }
+        end
+      end
+      pod_mapping
     end
 
     def get_metadata_for_journal_record(record, time, batch_miss_cache)
